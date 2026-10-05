@@ -1,17 +1,29 @@
-import logging
 import os
+import re
+import sqlite3
+import logging
 import random
 import tempfile
+from datetime import datetime, timezone, timedelta
 
-from telegram import Update
+from gtts import gTTS
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
-    ContextTypes,
+    CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
+    ChatMemberHandler,
     filters,
 )
-from gtts import gTTS
 
 
 # =========================================================
@@ -22,8 +34,24 @@ TOKEN = os.getenv("TOKEN")
 
 if not TOKEN:
     raise RuntimeError(
-        "TOKEN is missing. Please add TOKEN in Railway Variables."
+        "TOKEN missing. Add TOKEN in Railway Variables."
     )
+
+
+# দুইজন BOT OWNER
+OWNER_IDS = {
+    8136997138,
+    8827019486,
+}
+
+
+# Railway Volume ব্যবহার করলে DATA_DIR variable দিতে পারো।
+# না দিলে বর্তমান project folder-এ database হবে।
+DATA_DIR = os.getenv("DATA_DIR", ".")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_FILE = os.path.join(DATA_DIR, "riya_bot.db")
 
 
 # =========================================================
@@ -35,79 +63,436 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("RIYA")
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+db = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False
+)
+
+db.row_factory = sqlite3.Row
+
+
+def db_execute(query, params=(), fetch=False, many=False):
+    cur = db.cursor()
+
+    if many:
+        cur.executemany(query, params)
+    else:
+        cur.execute(query, params)
+
+    db.commit()
+
+    if fetch:
+        return cur.fetchall()
+
+    return cur.lastrowid
+
+
+def init_database():
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            is_blocked INTEGER DEFAULT 0,
+            created_at TEXT,
+            last_seen TEXT
+        )
+    """)
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER,
+            added_at TEXT
+        )
+    """)
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            created_at TEXT
+        )
+    """)
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword TEXT UNIQUE,
+            response TEXT,
+            enabled INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+
+
+# =========================================================
+# TIME
+# =========================================================
+
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today_start_utc():
+
+    now = datetime.now(timezone.utc)
+
+    start = datetime(
+        now.year,
+        now.month,
+        now.day,
+        tzinfo=timezone.utc
+    )
+
+    return start.isoformat()
+
+
+# =========================================================
+# USER MANAGEMENT
+# =========================================================
+
+def register_user(user):
+
+    if not user:
+        return
+
+    uid = user.id
+    first_name = user.first_name or ""
+    username = user.username or ""
+    current = now_utc()
+
+    existing = db_execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (uid,),
+        fetch=True
+    )
+
+    if existing:
+
+        db_execute("""
+            UPDATE users
+            SET first_name=?,
+                username=?,
+                last_seen=?
+            WHERE user_id=?
+        """, (
+            first_name,
+            username,
+            current,
+            uid
+        ))
+
+    else:
+
+        db_execute("""
+            INSERT INTO users
+            (user_id, first_name, username, created_at, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            uid,
+            first_name,
+            username,
+            current,
+            current
+        ))
+
+
+def log_usage(user_id):
+
+    db_execute("""
+        INSERT INTO usage
+        (user_id, created_at)
+        VALUES (?, ?)
+    """, (
+        user_id,
+        now_utc()
+    ))
+
+
+def is_blocked(user_id):
+
+    result = db_execute(
+        "SELECT is_blocked FROM users WHERE user_id=?",
+        (user_id,),
+        fetch=True
+    )
+
+    if not result:
+        return False
+
+    return bool(result[0]["is_blocked"])
+
+
+# =========================================================
+# ADMIN MANAGEMENT
+# =========================================================
+
+def is_owner(user_id):
+    return user_id in OWNER_IDS
+
+
+def is_admin(user_id):
+
+    if is_owner(user_id):
+        return True
+
+    result = db_execute(
+        "SELECT user_id FROM admins WHERE user_id=?",
+        (user_id,),
+        fetch=True
+    )
+
+    return bool(result)
+
+
+def add_admin(user_id, added_by):
+
+    db_execute("""
+        INSERT OR REPLACE INTO admins
+        (user_id, added_by, added_at)
+        VALUES (?, ?, ?)
+    """, (
+        user_id,
+        added_by,
+        now_utc()
+    ))
+
+
+def remove_admin(user_id):
+
+    if is_owner(user_id):
+        return False
+
+    db_execute(
+        "DELETE FROM admins WHERE user_id=?",
+        (user_id,)
+    )
+
+    return True
+
+
+def get_admins():
+
+    return db_execute("""
+        SELECT user_id, added_by, added_at
+        FROM admins
+        ORDER BY added_at ASC
+    """, fetch=True)
+
+
+# =========================================================
+# BLOCK SYSTEM
+# =========================================================
+
+def block_user(user_id):
+
+    db_execute("""
+        UPDATE users
+        SET is_blocked=1
+        WHERE user_id=?
+    """, (user_id,))
+
+
+def unblock_user(user_id):
+
+    db_execute("""
+        UPDATE users
+        SET is_blocked=0
+        WHERE user_id=?
+    """, (user_id,))
+
+
+# =========================================================
+# VOICE CLEANER
+# =========================================================
+
+def remove_emojis_for_voice(text):
+
+    if not text:
+        return ""
+
+    # Emoji / symbol ranges
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F1E0-\U0001F1FF"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F600-\U0001F64F"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"
+        "\U0001FA00-\U0001FAFF"
+        "\U00002700-\U000027BF"
+        "\U00002600-\U000026FF"
+        "\U00002B00-\U00002BFF"
+        "\u200d"
+        "\ufe0f"
+        "\u20e3"
+        "]+",
+        flags=re.UNICODE
+    )
+
+    cleaned = emoji_pattern.sub(" ", text)
+
+    # Extra symbols
+    cleaned = re.sub(
+        r"[\u2600-\u27BF]",
+        " ",
+        cleaned
+    )
+
+    # Multiple spaces
+    cleaned = re.sub(
+        r"\s+",
+        " ",
+        cleaned
+    )
+
+    return cleaned.strip()
 
 
 # =========================================================
 # TEXT TO VOICE
 # =========================================================
 
-def text_to_voice(text: str):
-    """
-    Convert Bengali text to an MP3 voice file.
-    A temporary file is used so multiple users don't conflict.
-    """
+def create_voice(text):
 
-    temp_file = tempfile.NamedTemporaryFile(
+    clean_text = remove_emojis_for_voice(text)
+
+    if not clean_text:
+        return None
+
+    temp = tempfile.NamedTemporaryFile(
         suffix=".mp3",
         delete=False
     )
 
-    filename = temp_file.name
-    temp_file.close()
+    filename = temp.name
+    temp.close()
 
     try:
+
         tts = gTTS(
-            text=text,
+            text=clean_text,
             lang="bn",
             slow=False
         )
+
         tts.save(filename)
+
         return filename
 
     except Exception:
+
         if os.path.exists(filename):
             os.remove(filename)
-        raise
+
+        return None
 
 
 # =========================================================
 # SEND TEXT + VOICE
 # =========================================================
 
-async def send_text_and_voice(
-    update: Update,
-    text: str
+async def send_text_voice(
+    update,
+    text,
+    voice=True
 ):
+
     if not update.message:
         return
 
-    # Text
     await update.message.reply_text(text)
 
-    # Voice
+    if not voice:
+        return
+
     voice_file = None
 
     try:
-        voice_file = text_to_voice(text)
 
-        with open(voice_file, "rb") as audio:
-            await update.message.reply_voice(
-                voice=audio
-            )
+        voice_file = create_voice(text)
+
+        if voice_file:
+
+            with open(voice_file, "rb") as audio:
+
+                await update.message.reply_voice(
+                    voice=audio
+                )
 
     except Exception as e:
+
         logger.error(
-            "Voice generation failed: %s",
+            "Voice error: %s",
             e
         )
 
     finally:
+
         if voice_file and os.path.exists(voice_file):
+
             try:
                 os.remove(voice_file)
             except Exception:
                 pass
+
+
+# =========================================================
+# USER MAIN MENU
+# =========================================================
+
+def user_menu(bot_username=None):
+
+    buttons = [
+
+        [
+            InlineKeyboardButton(
+                "➕ Add Your Group",
+                url=(
+                    f"https://t.me/{bot_username}"
+                    f"?startgroup=true"
+                    if bot_username
+                    else "https://t.me/"
+                )
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📖 Help",
+                callback_data="user_help"
+            ),
+            InlineKeyboardButton(
+                "🌹 Rose",
+                callback_data="user_rose"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "😂 Joke",
+                callback_data="user_joke"
+            ),
+            InlineKeyboardButton(
+                "💖 Love",
+                callback_data="user_love"
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(buttons)
 
 
 # =========================================================
@@ -119,456 +504,469 @@ async def start_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message:
+    user = update.effective_user
+
+    if not user or not update.message:
         return
 
-    user_name = (
-        update.effective_user.first_name
-        if update.effective_user
-        else "বন্ধু"
-    )
+    register_user(user)
 
-    welcome_msg = (
-        f"🌟✨ হ্যালো {user_name}! 👋💖\n\n"
-        "🤖 আমি RIYA AI Bot! 🥰✨\n"
-        "আমার সাথে আড্ডা, মজার কথা এবং AI-style chat করতে পারো।\n\n"
-        "💬 Available Commands:\n\n"
-        "🌹 /rose — গোলাপ ও শুভেচ্ছা\n"
-        "💖 /lovechat — মিষ্টি ভালোবাসার মেসেজ\n"
-        "😂 /joke — মজার জোকস\n"
-        "🤭 /naughty — মজার দুষ্টু জোকস\n"
-        "📌 /help — সব কমান্ড দেখতে\n\n"
-        "💡 যেকোনো সাধারণ মেসেজ লিখলেও আমি উত্তর দেওয়ার চেষ্টা করব।"
-    )
-
-    await update.message.reply_text(welcome_msg)
-
-
-# =========================================================
-# /HELP
-# =========================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
+    if is_blocked(user.id):
+        await update.message.reply_text(
+            "🚫 আপনার account blocked করা হয়েছে।"
+        )
         return
 
-    help_text = (
-        "📌✨ RIYA Bot Menu 🌸\n\n"
-        "🧠 AI Chat\n"
-        "সাধারণ মেসেজ পাঠালে RIYA উত্তর দেবে।\n\n"
-        "💖 /lovechat\n"
-        "মিষ্টি ভালোবাসার মেসেজ।\n\n"
-        "🌹 /rose\n"
-        "গোলাপের শুভেচ্ছা।\n\n"
-        "😂 /joke\n"
-        "মজার জোকস।\n\n"
-        "🤭 /naughty\n"
-        "হালকা মজার দুষ্টু জোকস।\n\n"
-        "🎙️ Voice Reply\n"
-        "অনেক উত্তরের সাথে Bengali voice reply পাঠানো হবে।\n\n"
-        "🎉 Group Welcome\n"
-        "নতুন member join করলে welcome message পাঠাবে।"
+    log_usage(user.id)
+
+    bot_info = await context.bot.get_me()
+
+    text = (
+        f"🌟 হ্যালো {user.first_name or 'বন্ধু'}!\n\n"
+        "🤖 আমি RIYA Bot.\n"
+        "নিচের button থেকে feature ব্যবহার করো।\n\n"
+        "➕ Add Your Group চাপলে bot-কে তোমার group-এ "
+        "add করতে পারবে।\n\n"
+        "⚠️ Group-এ bot-কে প্রয়োজনীয় admin permission দিতে হবে।"
     )
 
-    await update.message.reply_text(help_text)
-
-
-# =========================================================
-# JOKES
-# =========================================================
-
-async def joke_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    jokes = [
-        (
-            "🤣 শিক্ষক: পল্টু, বল তো বক্তৃতা আর সংশোধনের মধ্যে "
-            "পার্থক্য কী?\n\n"
-            "🧠 পল্টু: স্যার, অনেকক্ষণ ভুল কথা বলা হলো বক্তৃতা, "
-            "আর সেই ভুলের জন্য বকা খাওয়া হলো সংশোধন! 😂"
-        ),
-
-        (
-            "😂 পল্টু: ডাক্তার সাহেব, আমি যা দেখি সব ডবল দেখি!\n"
-            "🩺 ডাক্তার: আচ্ছা, ওই সোফায় বসুন।\n"
-            "😳 পল্টু: কোন সোফায়? এখানে তো চারটা সোফা! 🤣"
-        ),
-
-        (
-            "🤭 বন্ধু: রাতে ঘুম হলো?\n"
-            "😴 পল্টু: হয়েছিল।\n"
-            "বন্ধু: তাহলে সকালে এত দেরি?\n"
-            "😂 পল্টু: ঘুমটা সুন্দর ছিল, তাই ছাড়তে মন চায়নি!"
-        ),
-    ]
-
-    selected_joke = random.choice(jokes)
-
-    await send_text_and_voice(
-        update,
-        selected_joke
+    await update.message.reply_text(
+        text,
+        reply_markup=user_menu(bot_info.username)
     )
 
 
 # =========================================================
-# NAUGHTY / FUN
+# HELP BUTTON
 # =========================================================
 
-async def naughty_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def show_user_help(
+    query
 ):
 
-    stories = [
-        (
-            "🤭 দুষ্টু জোকস:\n\n"
-            "👩: তুমি আমাকে কতটা ভালোবাসো?\n"
-            "😎: এতটাই যে তোমার জন্য চকলেটও ভাগ করে খাব!\n"
-            "😂 তারপর নিজের অংশটা লুকিয়ে ফেলল!"
-        ),
+    text = (
+        "📖 RIYA Bot Help\n\n"
+        "➕ Add Your Group — bot-কে group-এ add করার জন্য\n"
+        "🌹 Rose — rose message\n"
+        "😂 Joke — joke\n"
+        "💖 Love — friendly love message\n\n"
+        "Group auto-reply চালাতে bot-কে group admin "
+        "করতে হবে এবং BotFather থেকে Privacy Mode OFF "
+        "করতে হবে।"
+    )
 
-        (
-            "😜 বন্ধু: তুই এত হাসিস কেন?\n"
-            "😂 পল্টু: কারণ আমার হাসির জন্য কোনো ডাটা প্যাক লাগে না!"
-        ),
-    ]
-
-    selected = random.choice(stories)
-
-    await send_text_and_voice(
-        update,
-        selected
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="user_home"
+                )
+            ]
+        ])
     )
 
 
 # =========================================================
-# LOVE CHAT
+# USER BUTTON ACTIONS
 # =========================================================
 
-async def lovechat_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    messages = [
-        (
-            "💖✨ তোমার সাথে কথা বললে মনটা ভালো হয়ে যায়। "
-            "তোমার দিনটা সুন্দর হোক—এই শুভকামনা রইল। 🌸"
-        ),
-
-        (
-            "🌹💖 কিছু মানুষ জীবনে এসে সাধারণ মুহূর্তকেও "
-            "সুন্দর করে তোলে। তোমার জন্য রইল একগুচ্ছ শুভকামনা। ✨"
-        ),
-
-        (
-            "🥰✨ হাসিখুশি থেকো, নিজের যত্ন নিও এবং "
-            "প্রতিদিন নতুন কিছু শেখার চেষ্টা করো। 🌸💖"
-        ),
-    ]
-
-    selected = random.choice(messages)
-
-    await send_text_and_voice(
-        update,
-        selected
-    )
-
-
-# =========================================================
-# ROSE
-# =========================================================
-
-async def rose_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def user_rose(query):
 
     roses = [
-        (
-            "🌹✨ এই নাও তোমার জন্য সুন্দর একটি গোলাপ! "
-            "তোমার দিনটা আনন্দে ভরে উঠুক। 💖"
-        ),
-
-        (
-            "🌹🌹🌹 একগুচ্ছ গোলাপ তোমার জন্য! "
-            "হাসিখুশি থেকো আর সুন্দর সময় কাটাও। ✨"
-        ),
-
-        (
-            "🌹💐 গোলাপের মতো সুন্দর হোক তোমার আজকের দিন। "
-            "অনেক শুভকামনা! 💖✨"
-        ),
+        "🌹 তোমার জন্য একটি সুন্দর গোলাপ! দিনটা ভালো কাটুক।",
+        "🌹💐 অনেক শুভকামনা রইল তোমার জন্য!",
+        "🌹 হাসিখুশি থেকো, সুন্দর থাকো।",
     ]
 
-    selected = random.choice(roses)
+    await query.message.reply_text(
+        random.choice(roses)
+    )
 
-    await send_text_and_voice(
-        update,
-        selected
+
+async def user_joke(query):
+
+    jokes = [
+        "😂 শিক্ষক: পড়া শিখেছো?\nছাত্র: স্যার, বই খুলেছি—এটাই অনেক!",
+        "🤣 বন্ধু: এত হাসছিস কেন?\nপল্টু: কারণ কান্না করলে সবাই প্রশ্ন করে!",
+    ]
+
+    await query.message.reply_text(
+        random.choice(jokes)
+    )
+
+
+async def user_love(query):
+
+    messages = [
+        "💖 তোমার দিনটা সুন্দর হোক। নিজের যত্ন নিও।",
+        "🌸 ভালো থেকো, হাসিখুশি থেকো।",
+        "💖 সুন্দর সম্পর্কের ভিত্তি হলো সম্মান ও বিশ্বাস।",
+    ]
+
+    await query.message.reply_text(
+        random.choice(messages)
     )
 
 
 # =========================================================
-# GROUP WELCOME
+# DASHBOARD MAIN
 # =========================================================
 
-async def welcome_member(
+def dashboard_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "📊 Statistics",
+                callback_data="admin_stats"
+            ),
+            InlineKeyboardButton(
+                "👥 Users",
+                callback_data="admin_users"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🚫 Block User",
+                callback_data="admin_block"
+            ),
+            InlineKeyboardButton(
+                "✅ Unblock User",
+                callback_data="admin_unblock"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "➕ Add Admin",
+                callback_data="admin_add"
+            ),
+            InlineKeyboardButton(
+                "➖ Remove Admin",
+                callback_data="admin_remove"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "👑 Admin List",
+                callback_data="admin_list"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💬 Reply System",
+                callback_data="reply_menu"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📢 Broadcast",
+                callback_data="broadcast"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔄 Refresh",
+                callback_data="dashboard"
+            )
+        ],
+    ])
+
+
+async def dashboard_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message:
+    user = update.effective_user
+
+    if not user:
         return
 
-    if not update.message.new_chat_members:
+    register_user(user)
+
+    if not is_admin(user.id):
+
+        await update.message.reply_text(
+            "🚫 এই panel শুধুমাত্র bot admin/owner-এর জন্য।"
+        )
+
         return
 
-    for member in update.message.new_chat_members:
-
-        name = member.first_name or "বন্ধু"
-
-        welcome_text = (
-            f"🌟🎉 Welcome {name}! 🥳💖\n\n"
-            "আমাদের গ্রুপে তোমাকে স্বাগতম! ✨\n"
-            "আশা করি আমাদের সাথে তোমার সময়টা সুন্দর কাটবে। 🌸"
-        )
-
-        await send_text_and_voice(
-            update,
-            welcome_text
-        )
+    await show_dashboard(
+        update.message,
+        user.id
+    )
 
 
-# =========================================================
-# MESSAGE HANDLER
-# =========================================================
-
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def show_dashboard(
+    message,
+    user_id
 ):
 
-    if not update.message:
+    total_users = db_execute(
+        "SELECT COUNT(*) AS c FROM users",
+        fetch=True
+    )[0]["c"]
+
+    today_users = db_execute(
+        """
+        SELECT COUNT(DISTINCT user_id) AS c
+        FROM usage
+        WHERE created_at >= ?
+        """,
+        (today_start_utc(),),
+        fetch=True
+    )[0]["c"]
+
+    total_uses = db_execute(
+        "SELECT COUNT(*) AS c FROM usage",
+        fetch=True
+    )[0]["c"]
+
+    admins = len(get_admins()) + len(OWNER_IDS)
+
+    text = (
+        "👑 RIYA BOT ADMIN PANEL\n\n"
+        f"👥 Total Users: {total_users}\n"
+        f"📅 Today Active: {today_users}\n"
+        f"📈 Total Bot Uses: {total_uses}\n"
+        f"👑 Admin/Owners: {admins}\n\n"
+        "নিচের button থেকে management করো।"
+    )
+
+    await message.reply_text(
+        text,
+        reply_markup=dashboard_keyboard()
+    )
+
+
+# =========================================================
+# STATS
+# =========================================================
+
+async def admin_stats(query):
+
+    if not is_admin(query.from_user.id):
         return
 
-    if not update.message.text:
+    total = db_execute(
+        "SELECT COUNT(*) AS c FROM users",
+        fetch=True
+    )[0]["c"]
+
+    today = db_execute(
+        """
+        SELECT COUNT(DISTINCT user_id) AS c
+        FROM usage
+        WHERE created_at >= ?
+        """,
+        (today_start_utc(),),
+        fetch=True
+    )[0]["c"]
+
+    uses = db_execute(
+        "SELECT COUNT(*) AS c FROM usage",
+        fetch=True
+    )[0]["c"]
+
+    blocked = db_execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM users
+        WHERE is_blocked=1
+        """,
+        fetch=True
+    )[0]["c"]
+
+    text = (
+        "📊 BOT STATISTICS\n\n"
+        f"👥 Total Users: {total}\n"
+        f"🟢 Today Active Users: {today}\n"
+        f"📈 Total Uses: {uses}\n"
+        f"🚫 Blocked Users: {blocked}"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Dashboard",
+                    callback_data="dashboard"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# USER LIST
+# =========================================================
+
+async def admin_users(query):
+
+    if not is_admin(query.from_user.id):
         return
 
-    user_input = update.message.text.strip()
-    text = user_input.lower()
+    users = db_execute("""
+        SELECT user_id, first_name, username, is_blocked
+        FROM users
+        ORDER BY last_seen DESC
+        LIMIT 30
+    """, fetch=True)
 
-    if not user_input:
-        return
+    if not users:
 
-    # Love
-    if (
-        "i love you" in text
-        or "ভালোবাসি" in text
-    ):
-        reply = (
-            "❤️✨ তোমার কথাটা শুনে ভালো লাগল! "
-            "তোমার জন্য অনেক শুভকামনা ও ভালোবাসা রইল। 🌹🥰"
-        )
+        text = "👥 কোনো user নেই।"
 
-    # Meri Jaan
-    elif (
-        "meri jaan" in text
-        or "মেরি জান" in text
-    ):
-        reply = (
-            "😊💖 বলো, কী খবর? "
-            "আমি শুনছি। 🌸✨"
-        )
-
-    # Relationship
-    elif (
-        "রিলেশন" in text
-        or "প্রেম" in text
-        or "relationship" in text
-    ):
-        reply = (
-            "💖 সম্পর্কের সবচেয়ে গুরুত্বপূর্ণ বিষয় হলো "
-            "সম্মান, বিশ্বাস এবং ভালো যোগাযোগ। 🌸✨"
-        )
-
-    # Rose
-    elif (
-        "rose" in text
-        or "গোলাপ" in text
-        or "ফুল" in text
-    ):
-        await rose_handler(update, context)
-        return
-
-    # Naughty
-    elif (
-        "দুষ্টু" in text
-        or "naughty" in text
-    ):
-        await naughty_handler(update, context)
-        return
-
-    # How are you
-    elif (
-        "কেমন আছো" in text
-        or "how are you" in text
-    ):
-        reply = (
-            "😊✨ আমি ভালো আছি! "
-            "তোমার সাথে কথা বলছি। তুমি কেমন আছো?"
-        )
-
-    # Who are you
-    elif (
-        "কে তুমি" in text
-        or "who are you" in text
-    ):
-        reply = (
-            "🤖✨ আমি RIYA Bot!\n\n"
-            "আমি একটি Telegram bot, "
-            "যে বিভিন্ন command এবং message-এর "
-            "উত্তর দিতে পারে। 💖"
-        )
-
-    # Joke
-    elif (
-        "জোক" in text
-        or "জোকস" in text
-        or "joke" in text
-        or "jokes" in text
-        or "মজার কাহিনী" in text
-    ):
-        await joke_handler(update, context)
-        return
-
-    # General message
     else:
-        reply = (
-            "🤖✨ RIYA AI Chat\n\n"
-            f"💬 তুমি লিখেছো:\n{user_input}\n\n"
-            "🌸 তোমার মেসেজটি পেয়েছি! "
-            "আমি এখনো একটি simple chatbot mode-এ আছি, "
-            "তাই সব প্রশ্নের real AI উত্তর দিতে পারি না। "
-            "তবে /help লিখলে available features দেখতে পারবে। 😊"
-        )
 
-    await send_text_and_voice(
-        update,
-        reply
+        lines = ["👥 Recent Users\n"]
+
+        for u in users:
+
+            status = (
+                "🚫 BLOCKED"
+                if u["is_blocked"]
+                else "🟢 ACTIVE"
+            )
+
+            name = u["first_name"] or "Unknown"
+
+            username = (
+                f"@{u['username']}"
+                if u["username"]
+                else ""
+            )
+
+            lines.append(
+                f"{name} {username}\n"
+                f"ID: `{u['user_id']}` • {status}\n"
+            )
+
+        text = "\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Dashboard",
+                    callback_data="dashboard"
+                )
+            ]
+        ])
     )
 
 
 # =========================================================
-# ERROR HANDLER
+# ADMIN LIST
 # =========================================================
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def admin_list(query):
 
-    logger.error(
-        "Telegram bot error: %s",
-        context.error
-    )
+    if not is_admin(query.from_user.id):
+        return
 
+    lines = [
+        "👑 BOT OWNERS\n",
+        "👑 8136997138",
+        "👑 8827019486",
+        "",
+        "🛡️ EXTRA ADMINS",
+    ]
 
-# =========================================================
-# MAIN
-# =========================================================
+    admins = get_admins()
 
-def main():
+    if admins:
 
-    logger.info("Starting RIYA Telegram Bot...")
+        for admin in admins:
+            lines.append(
+                f"🛡️ {admin['user_id']}"
+            )
 
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
+    else:
 
-    # Commands
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start_command
+        lines.append(
+            "No extra admin added."
         )
-    )
 
-    app.add_handler(
-        CommandHandler(
-            "help",
-            help_command
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "joke",
-            joke_handler
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "naughty",
-            naughty_handler
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "rose",
-            rose_handler
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "lovechat",
-            lovechat_handler
-        )
-    )
-
-    # New group members
-    app.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.NEW_CHAT_MEMBERS,
-            welcome_member
-        )
-    )
-
-    # Normal text messages
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message
-        )
-    )
-
-    # Errors
-    app.add_error_handler(error_handler)
-
-    logger.info(
-        "🤖 RIYA Bot is running successfully..."
-    )
-
-    # Start polling
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Dashboard",
+                    callback_data="dashboard"
+                )
+            ]
+        ])
     )
 
 
 # =========================================================
-# ENTRY POINT
+# REPLY SYSTEM MENU
 # =========================================================
 
-if __name__ == "__main__":
-    main()
+def reply_menu_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "➕ Add Reply",
+                callback_data="reply_add"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📋 View Replies",
+                callback_data="reply_list"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🗑 Delete Reply",
+                callback_data="reply_delete"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "⬅️ Dashboard",
+                callback_data="dashboard"
+            )
+        ],
+    ])
+
+
+async def reply_menu(query):
+
+    if not is_admin(query.from_user.id):
+        return
+
+    await query.edit_message_text(
+        "💬 GROUP AUTO-REPLY SYSTEM\n\n"
+        "এখান থেকে group-এর জন্য keyword ও reply message "
+        "add/delete করতে পারবে।",
+        reply_markup=reply_menu_keyboard()
+    )
+
+
+# =========================================================
+# REPLY LIST
+# =========================================================
+
+async d

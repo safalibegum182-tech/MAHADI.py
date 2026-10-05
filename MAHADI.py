@@ -4,969 +4,593 @@ import sqlite3
 import logging
 import random
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from gtts import gTTS
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ChatMemberStatus
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    ChatMemberHandler,
-    filters,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
 )
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-TOKEN = os.getenv("TOKEN")
-
-if not TOKEN:
-    raise RuntimeError(
-        "TOKEN missing. Add TOKEN in Railway Variables."
-    )
-
-
-# দুইজন BOT OWNER
-OWNER_IDS = {
-    8136997138,
-    8827019486,
-}
-
-
-# Railway Volume ব্যবহার করলে DATA_DIR variable দিতে পারো।
-# না দিলে বর্তমান project folder-এ database হবে।
-DATA_DIR = os.getenv("DATA_DIR", ".")
-
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_FILE = os.path.join(DATA_DIR, "riya_bot.db")
-
-
-# =========================================================
-# LOGGING
-# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
-
 logger = logging.getLogger("RIYA")
 
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("TOKEN is missing. Add TOKEN in Railway Variables.")
 
-# =========================================================
-# DATABASE
-# =========================================================
+OWNER_IDS = {8136997138, 8827019486}
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.path.join(DATA_DIR, "riya_bot.db")
 
-db = sqlite3.connect(
-    DB_FILE,
-    check_same_thread=False
-)
-
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.row_factory = sqlite3.Row
 
 
-def db_execute(query, params=(), fetch=False, many=False):
+def db_exec(sql, params=(), fetch=False):
     cur = db.cursor()
-
-    if many:
-        cur.executemany(query, params)
-    else:
-        cur.execute(query, params)
-
+    cur.execute(sql, params)
     db.commit()
-
-    if fetch:
-        return cur.fetchall()
-
-    return cur.lastrowid
+    return cur.fetchall() if fetch else cur.lastrowid
 
 
-def init_database():
-
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            first_name TEXT,
-            username TEXT,
-            is_blocked INTEGER DEFAULT 0,
-            created_at TEXT,
-            last_seen TEXT
-        )
-    """)
-
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at TEXT
-        )
-    """)
-
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            created_at TEXT
-        )
-    """)
-
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS replies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            keyword TEXT UNIQUE,
-            response TEXT,
-            enabled INTEGER DEFAULT 1,
-            created_at TEXT
-        )
-    """)
+def init_db():
+    db_exec("""CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        first_name TEXT,
+        username TEXT,
+        blocked INTEGER DEFAULT 0,
+        created_at TEXT,
+        last_seen TEXT
+    )""")
+    db_exec("""CREATE TABLE IF NOT EXISTS admins(
+        user_id INTEGER PRIMARY KEY,
+        added_by INTEGER,
+        added_at TEXT
+    )""")
+    db_exec("""CREATE TABLE IF NOT EXISTS usage(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        created_at TEXT
+    )""")
+    db_exec("""CREATE TABLE IF NOT EXISTS replies(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        keyword TEXT UNIQUE,
+        response TEXT,
+        enabled INTEGER DEFAULT 1
+    )""")
 
 
-# =========================================================
-# TIME
-# =========================================================
-
-def now_utc():
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def today_start_utc():
-
-    now = datetime.now(timezone.utc)
-
-    start = datetime(
-        now.year,
-        now.month,
-        now.day,
-        tzinfo=timezone.utc
-    )
-
-    return start.isoformat()
+def today():
+    d = datetime.now(timezone.utc)
+    return d.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
-# =========================================================
-# USER MANAGEMENT
-# =========================================================
-
-def register_user(user):
-
+def register(user):
     if not user:
         return
-
-    uid = user.id
-    first_name = user.first_name or ""
-    username = user.username or ""
-    current = now_utc()
-
-    existing = db_execute(
-        "SELECT user_id FROM users WHERE user_id=?",
-        (uid,),
-        fetch=True
-    )
-
-    if existing:
-
-        db_execute("""
-            UPDATE users
-            SET first_name=?,
-                username=?,
-                last_seen=?
-            WHERE user_id=?
-        """, (
-            first_name,
-            username,
-            current,
-            uid
-        ))
-
+    row = db_exec("SELECT user_id FROM users WHERE user_id=?", (user.id,), True)
+    if row:
+        db_exec(
+            "UPDATE users SET first_name=?, username=?, last_seen=? WHERE user_id=?",
+            (user.first_name or "", user.username or "", now(), user.id)
+        )
     else:
-
-        db_execute("""
-            INSERT INTO users
-            (user_id, first_name, username, created_at, last_seen)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            uid,
-            first_name,
-            username,
-            current,
-            current
-        ))
-
-
-def log_usage(user_id):
-
-    db_execute("""
-        INSERT INTO usage
-        (user_id, created_at)
-        VALUES (?, ?)
-    """, (
-        user_id,
-        now_utc()
-    ))
-
-
-def is_blocked(user_id):
-
-    result = db_execute(
-        "SELECT is_blocked FROM users WHERE user_id=?",
-        (user_id,),
-        fetch=True
-    )
-
-    if not result:
-        return False
-
-    return bool(result[0]["is_blocked"])
-
-
-# =========================================================
-# ADMIN MANAGEMENT
-# =========================================================
-
-def is_owner(user_id):
-    return user_id in OWNER_IDS
-
-
-def is_admin(user_id):
-
-    if is_owner(user_id):
-        return True
-
-    result = db_execute(
-        "SELECT user_id FROM admins WHERE user_id=?",
-        (user_id,),
-        fetch=True
-    )
-
-    return bool(result)
-
-
-def add_admin(user_id, added_by):
-
-    db_execute("""
-        INSERT OR REPLACE INTO admins
-        (user_id, added_by, added_at)
-        VALUES (?, ?, ?)
-    """, (
-        user_id,
-        added_by,
-        now_utc()
-    ))
-
-
-def remove_admin(user_id):
-
-    if is_owner(user_id):
-        return False
-
-    db_execute(
-        "DELETE FROM admins WHERE user_id=?",
-        (user_id,)
-    )
-
-    return True
-
-
-def get_admins():
-
-    return db_execute("""
-        SELECT user_id, added_by, added_at
-        FROM admins
-        ORDER BY added_at ASC
-    """, fetch=True)
-
-
-# =========================================================
-# BLOCK SYSTEM
-# =========================================================
-
-def block_user(user_id):
-
-    db_execute("""
-        UPDATE users
-        SET is_blocked=1
-        WHERE user_id=?
-    """, (user_id,))
-
-
-def unblock_user(user_id):
-
-    db_execute("""
-        UPDATE users
-        SET is_blocked=0
-        WHERE user_id=?
-    """, (user_id,))
-
-
-# =========================================================
-# VOICE CLEANER
-# =========================================================
-
-def remove_emojis_for_voice(text):
-
-    if not text:
-        return ""
-
-    # Emoji / symbol ranges
-    emoji_pattern = re.compile(
-        "["
-        "\U0001F1E0-\U0001F1FF"
-        "\U0001F300-\U0001F5FF"
-        "\U0001F600-\U0001F64F"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F700-\U0001F77F"
-        "\U0001F780-\U0001F7FF"
-        "\U0001F800-\U0001F8FF"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FAFF"
-        "\U00002700-\U000027BF"
-        "\U00002600-\U000026FF"
-        "\U00002B00-\U00002BFF"
-        "\u200d"
-        "\ufe0f"
-        "\u20e3"
-        "]+",
-        flags=re.UNICODE
-    )
-
-    cleaned = emoji_pattern.sub(" ", text)
-
-    # Extra symbols
-    cleaned = re.sub(
-        r"[\u2600-\u27BF]",
-        " ",
-        cleaned
-    )
-
-    # Multiple spaces
-    cleaned = re.sub(
-        r"\s+",
-        " ",
-        cleaned
-    )
-
-    return cleaned.strip()
-
-
-# =========================================================
-# TEXT TO VOICE
-# =========================================================
-
-def create_voice(text):
-
-    clean_text = remove_emojis_for_voice(text)
-
-    if not clean_text:
-        return None
-
-    temp = tempfile.NamedTemporaryFile(
-        suffix=".mp3",
-        delete=False
-    )
-
-    filename = temp.name
-    temp.close()
-
-    try:
-
-        tts = gTTS(
-            text=clean_text,
-            lang="bn",
-            slow=False
+        db_exec(
+            "INSERT INTO users(user_id,first_name,username,created_at,last_seen) VALUES(?,?,?,?,?)",
+            (user.id, user.first_name or "", user.username or "", now(), now())
         )
 
-        tts.save(filename)
 
-        return filename
+def usage(user_id):
+    db_exec("INSERT INTO usage(user_id,created_at) VALUES(?,?)", (user_id, now()))
 
+
+def blocked(uid):
+    rows = db_exec("SELECT blocked FROM users WHERE user_id=?", (uid,), True)
+    return bool(rows and rows[0]["blocked"])
+
+
+def owner(uid):
+    return uid in OWNER_IDS
+
+
+def admin(uid):
+    if owner(uid):
+        return True
+    return bool(db_exec("SELECT user_id FROM admins WHERE user_id=?", (uid,), True))
+
+
+def clean_voice(text):
+    # Remove emoji and variation/joiner characters so gTTS speaks only text.
+    text = re.sub(
+        r"[\U0001F1E0-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\u200D\uFE0F\u20E3]+",
+        " ",
+        text
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def make_voice(text):
+    clean = clean_voice(text)
+    if not clean:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    try:
+        gTTS(clean, lang="bn", slow=False).save(path)
+        return path
     except Exception:
-
-        if os.path.exists(filename):
-            os.remove(filename)
-
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return None
 
 
-# =========================================================
-# SEND TEXT + VOICE
-# =========================================================
-
-async def send_text_voice(
-    update,
-    text,
-    voice=True
-):
-
-    if not update.message:
-        return
-
-    await update.message.reply_text(text)
-
+async def send_text_voice(message, text, voice=True):
+    await message.reply_text(text)
     if not voice:
         return
-
-    voice_file = None
-
+    path = make_voice(text)
+    if not path:
+        return
     try:
-
-        voice_file = create_voice(text)
-
-        if voice_file:
-
-            with open(voice_file, "rb") as audio:
-
-                await update.message.reply_voice(
-                    voice=audio
-                )
-
-    except Exception as e:
-
-        logger.error(
-            "Voice error: %s",
-            e
-        )
-
+        with open(path, "rb") as f:
+            await message.reply_voice(voice=f)
+    except Exception as exc:
+        logger.warning("Voice failed: %s", exc)
     finally:
-
-        if voice_file and os.path.exists(voice_file):
-
-            try:
-                os.remove(voice_file)
-            except Exception:
-                pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
-# =========================================================
-# USER MAIN MENU
-# =========================================================
-
-def user_menu(bot_username=None):
-
-    buttons = [
-
+def user_keyboard(bot_username):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "➕ Add Your Group",
+            url=f"https://t.me/{bot_username}?startgroup=true"
+        )],
         [
-            InlineKeyboardButton(
-                "➕ Add Your Group",
-                url=(
-                    f"https://t.me/{bot_username}"
-                    f"?startgroup=true"
-                    if bot_username
-                    else "https://t.me/"
-                )
-            )
+            InlineKeyboardButton("📖 Help", callback_data="help"),
+            InlineKeyboardButton("🌹 Rose", callback_data="rose")
         ],
-
         [
-            InlineKeyboardButton(
-                "📖 Help",
-                callback_data="user_help"
-            ),
-            InlineKeyboardButton(
-                "🌹 Rose",
-                callback_data="user_rose"
-            )
-        ],
+            InlineKeyboardButton("😂 Joke", callback_data="joke"),
+            InlineKeyboardButton("💖 Love", callback_data="love")
+        ]
+    ])
 
-        [
-            InlineKeyboardButton(
-                "😂 Joke",
-                callback_data="user_joke"
-            ),
-            InlineKeyboardButton(
-                "💖 Love",
-                callback_data="user_love"
-            )
-        ],
-    ]
-
-    return InlineKeyboardMarkup(buttons)
-
-
-# =========================================================
-# /START
-# =========================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if not user or not update.message:
-        return
-
-    register_user(user)
-
-    if is_blocked(user.id):
-        await update.message.reply_text(
-            "🚫 আপনার account blocked করা হয়েছে।"
-        )
-        return
-
-    log_usage(user.id)
-
-    bot_info = await context.bot.get_me()
-
-    text = (
-        f"🌟 হ্যালো {user.first_name or 'বন্ধু'}!\n\n"
-        "🤖 আমি RIYA Bot.\n"
-        "নিচের button থেকে feature ব্যবহার করো।\n\n"
-        "➕ Add Your Group চাপলে bot-কে তোমার group-এ "
-        "add করতে পারবে।\n\n"
-        "⚠️ Group-এ bot-কে প্রয়োজনীয় admin permission দিতে হবে।"
-    )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=user_menu(bot_info.username)
-    )
-
-
-# =========================================================
-# HELP BUTTON
-# =========================================================
-
-async def show_user_help(
-    query
-):
-
-    text = (
-        "📖 RIYA Bot Help\n\n"
-        "➕ Add Your Group — bot-কে group-এ add করার জন্য\n"
-        "🌹 Rose — rose message\n"
-        "😂 Joke — joke\n"
-        "💖 Love — friendly love message\n\n"
-        "Group auto-reply চালাতে bot-কে group admin "
-        "করতে হবে এবং BotFather থেকে Privacy Mode OFF "
-        "করতে হবে।"
-    )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data="user_home"
-                )
-            ]
-        ])
-    )
-
-
-# =========================================================
-# USER BUTTON ACTIONS
-# =========================================================
-
-async def user_rose(query):
-
-    roses = [
-        "🌹 তোমার জন্য একটি সুন্দর গোলাপ! দিনটা ভালো কাটুক।",
-        "🌹💐 অনেক শুভকামনা রইল তোমার জন্য!",
-        "🌹 হাসিখুশি থেকো, সুন্দর থাকো।",
-    ]
-
-    await query.message.reply_text(
-        random.choice(roses)
-    )
-
-
-async def user_joke(query):
-
-    jokes = [
-        "😂 শিক্ষক: পড়া শিখেছো?\nছাত্র: স্যার, বই খুলেছি—এটাই অনেক!",
-        "🤣 বন্ধু: এত হাসছিস কেন?\nপল্টু: কারণ কান্না করলে সবাই প্রশ্ন করে!",
-    ]
-
-    await query.message.reply_text(
-        random.choice(jokes)
-    )
-
-
-async def user_love(query):
-
-    messages = [
-        "💖 তোমার দিনটা সুন্দর হোক। নিজের যত্ন নিও।",
-        "🌸 ভালো থেকো, হাসিখুশি থেকো।",
-        "💖 সুন্দর সম্পর্কের ভিত্তি হলো সম্মান ও বিশ্বাস।",
-    ]
-
-    await query.message.reply_text(
-        random.choice(messages)
-    )
-
-
-# =========================================================
-# DASHBOARD MAIN
-# =========================================================
 
 def dashboard_keyboard():
-
     return InlineKeyboardMarkup([
-
         [
-            InlineKeyboardButton(
-                "📊 Statistics",
-                callback_data="admin_stats"
-            ),
-            InlineKeyboardButton(
-                "👥 Users",
-                callback_data="admin_users"
-            )
+            InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+            InlineKeyboardButton("👥 Users", callback_data="users")
         ],
-
         [
-            InlineKeyboardButton(
-                "🚫 Block User",
-                callback_data="admin_block"
-            ),
-            InlineKeyboardButton(
-                "✅ Unblock User",
-                callback_data="admin_unblock"
-            )
+            InlineKeyboardButton("🚫 Block", callback_data="block"),
+            InlineKeyboardButton("✅ Unblock", callback_data="unblock")
         ],
-
         [
-            InlineKeyboardButton(
-                "➕ Add Admin",
-                callback_data="admin_add"
-            ),
-            InlineKeyboardButton(
-                "➖ Remove Admin",
-                callback_data="admin_remove"
-            )
+            InlineKeyboardButton("➕ Add Admin", callback_data="add_admin"),
+            InlineKeyboardButton("➖ Remove Admin", callback_data="remove_admin")
         ],
-
-        [
-            InlineKeyboardButton(
-                "👑 Admin List",
-                callback_data="admin_list"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "💬 Reply System",
-                callback_data="reply_menu"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📢 Broadcast",
-                callback_data="broadcast"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔄 Refresh",
-                callback_data="dashboard"
-            )
-        ],
+        [InlineKeyboardButton("👑 Admin List", callback_data="admin_list")],
+        [InlineKeyboardButton("💬 Reply System", callback_data="reply_menu")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="dashboard")]
     ])
 
 
-async def dashboard_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def back_dashboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Dashboard", callback_data="dashboard")]
+    ])
 
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
     user = update.effective_user
-
-    if not user:
+    register(user)
+    if blocked(user.id):
+        await update.message.reply_text("🚫 আপনার account blocked করা হয়েছে।")
         return
-
-    register_user(user)
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "🚫 এই panel শুধুমাত্র bot admin/owner-এর জন্য।"
-        )
-
-        return
-
-    await show_dashboard(
-        update.message,
-        user.id
+    usage(user.id)
+    bot = await context.bot.get_me()
+    text = (
+        f"🌟 হ্যালো {user.first_name or 'বন্ধু'}!\n\n"
+        "🤖 আমি RIYA Bot। নিচের button ব্যবহার করো।\n\n"
+        "➕ Add Your Group চাপলে bot-কে group-এ add করতে পারবে।\n"
+        "Group-এ bot-কে admin permission দিতে হবে।"
     )
+    await update.message.reply_text(text, reply_markup=user_keyboard(bot.username))
 
 
-async def show_dashboard(
-    message,
-    user_id
-):
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    register(user)
+    if not admin(user.id):
+        await update.message.reply_text("🚫 এই panel শুধুমাত্র admin/owner-এর জন্য।")
+        return
+    await show_dashboard(update.message)
 
-    total_users = db_execute(
-        "SELECT COUNT(*) AS c FROM users",
-        fetch=True
+
+async def show_dashboard(message):
+    total = db_exec("SELECT COUNT(*) c FROM users", fetch=True)[0]["c"]
+    active = db_exec(
+        "SELECT COUNT(DISTINCT user_id) c FROM usage WHERE created_at>=?",
+        (today(),), True
     )[0]["c"]
-
-    today_users = db_execute(
-        """
-        SELECT COUNT(DISTINCT user_id) AS c
-        FROM usage
-        WHERE created_at >= ?
-        """,
-        (today_start_utc(),),
-        fetch=True
-    )[0]["c"]
-
-    total_uses = db_execute(
-        "SELECT COUNT(*) AS c FROM usage",
-        fetch=True
-    )[0]["c"]
-
-    admins = len(get_admins()) + len(OWNER_IDS)
-
+    uses = db_exec("SELECT COUNT(*) c FROM usage", fetch=True)[0]["c"]
+    extra_admins = db_exec("SELECT COUNT(*) c FROM admins", fetch=True)[0]["c"]
     text = (
         "👑 RIYA BOT ADMIN PANEL\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"📅 Today Active: {today_users}\n"
-        f"📈 Total Bot Uses: {total_uses}\n"
-        f"👑 Admin/Owners: {admins}\n\n"
-        "নিচের button থেকে management করো।"
-    )
-
-    await message.reply_text(
-        text,
-        reply_markup=dashboard_keyboard()
-    )
-
-
-# =========================================================
-# STATS
-# =========================================================
-
-async def admin_stats(query):
-
-    if not is_admin(query.from_user.id):
-        return
-
-    total = db_execute(
-        "SELECT COUNT(*) AS c FROM users",
-        fetch=True
-    )[0]["c"]
-
-    today = db_execute(
-        """
-        SELECT COUNT(DISTINCT user_id) AS c
-        FROM usage
-        WHERE created_at >= ?
-        """,
-        (today_start_utc(),),
-        fetch=True
-    )[0]["c"]
-
-    uses = db_execute(
-        "SELECT COUNT(*) AS c FROM usage",
-        fetch=True
-    )[0]["c"]
-
-    blocked = db_execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM users
-        WHERE is_blocked=1
-        """,
-        fetch=True
-    )[0]["c"]
-
-    text = (
-        "📊 BOT STATISTICS\n\n"
         f"👥 Total Users: {total}\n"
-        f"🟢 Today Active Users: {today}\n"
+        f"📅 Today Active: {active}\n"
         f"📈 Total Uses: {uses}\n"
-        f"🚫 Blocked Users: {blocked}"
+        f"👑 Owners: {len(OWNER_IDS)}\n"
+        f"🛡 Extra Admins: {extra_admins}"
     )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Dashboard",
-                    callback_data="dashboard"
-                )
-            ]
-        ])
-    )
+    await message.reply_text(text, reply_markup=dashboard_keyboard())
 
 
-# =========================================================
-# USER LIST
-# =========================================================
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    register(user)
+    data = q.data
 
-async def admin_users(query):
-
-    if not is_admin(query.from_user.id):
+    if data == "help":
+        await q.edit_message_text(
+            "📖 Help\n\n"
+            "➕ Add Your Group — group-এ bot add করার জন্য\n"
+            "🌹 Rose — rose message\n"
+            "😂 Joke — joke\n"
+            "💖 Love — friendly message",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="home")]]
+            )
+        )
         return
 
-    users = db_execute("""
-        SELECT user_id, first_name, username, is_blocked
-        FROM users
-        ORDER BY last_seen DESC
-        LIMIT 30
-    """, fetch=True)
-
-    if not users:
-
-        text = "👥 কোনো user নেই।"
-
-    else:
-
-        lines = ["👥 Recent Users\n"]
-
-        for u in users:
-
-            status = (
-                "🚫 BLOCKED"
-                if u["is_blocked"]
-                else "🟢 ACTIVE"
-            )
-
-            name = u["first_name"] or "Unknown"
-
-            username = (
-                f"@{u['username']}"
-                if u["username"]
-                else ""
-            )
-
-            lines.append(
-                f"{name} {username}\n"
-                f"ID: `{u['user_id']}` • {status}\n"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Dashboard",
-                    callback_data="dashboard"
-                )
-            ]
-        ])
-    )
-
-
-# =========================================================
-# ADMIN LIST
-# =========================================================
-
-async def admin_list(query):
-
-    if not is_admin(query.from_user.id):
+    if data == "home":
+        bot = await context.bot.get_me()
+        await q.edit_message_text(
+            "🌟 RIYA Bot Home",
+            reply_markup=user_keyboard(bot.username)
+        )
         return
 
-    lines = [
-        "👑 BOT OWNERS\n",
-        "👑 8136997138",
-        "👑 8827019486",
-        "",
-        "🛡️ EXTRA ADMINS",
-    ]
+    if data == "rose":
+        await q.message.reply_text(random.choice([
+            "🌹 তোমার জন্য একটি সুন্দর গোলাপ!",
+            "🌹💐 তোমার দিনটা সুন্দর হোক।"
+        ]))
+        return
 
-    admins = get_admins()
+    if data == "joke":
+        await q.message.reply_text(random.choice([
+            "😂 শিক্ষক: পড়া শিখেছো? ছাত্র: স্যার, বই খুলেছি—এটাই অনেক!",
+            "🤣 আমার WiFi এত slow যে Google-ও ভাবছে আমি offline!"
+        ]))
+        return
 
-    if admins:
+    if data == "love":
+        await q.message.reply_text("💖 ভালো থেকো, হাসিখুশি থেকো এবং সবাইকে সম্মান করো।")
+        return
 
-        for admin in admins:
-            lines.append(
-                f"🛡️ {admin['user_id']}"
+    if not admin(user.id):
+        await q.answer("🚫 Admin access required.", show_alert=True)
+        return
+
+    if data == "dashboard":
+        await q.edit_message_text("👑 RIYA BOT ADMIN PANEL", reply_markup=dashboard_keyboard())
+        return
+
+    if data == "stats":
+        total = db_exec("SELECT COUNT(*) c FROM users", fetch=True)[0]["c"]
+        active = db_exec(
+            "SELECT COUNT(DISTINCT user_id) c FROM usage WHERE created_at>=?",
+            (today(),), True
+        )[0]["c"]
+        uses = db_exec("SELECT COUNT(*) c FROM usage", fetch=True)[0]["c"]
+        blocked_count = db_exec("SELECT COUNT(*) c FROM users WHERE blocked=1", fetch=True)[0]["c"]
+        await q.edit_message_text(
+            f"📊 STATISTICS\n\n👥 Users: {total}\n🟢 Today Active: {active}\n"
+            f"📈 Total Uses: {uses}\n🚫 Blocked: {blocked_count}",
+            reply_markup=back_dashboard()
+        )
+        return
+
+    if data == "users":
+        rows = db_exec(
+            "SELECT user_id,first_name,username,blocked FROM users ORDER BY last_seen DESC LIMIT 30",
+            fetch=True
+        )
+        if not rows:
+            text = "👥 No users."
+        else:
+            parts = ["👥 RECENT USERS\n"]
+            for r in rows:
+                name = r["first_name"] or "Unknown"
+                un = f" @{r['username']}" if r["username"] else ""
+                status = "🚫" if r["blocked"] else "🟢"
+                parts.append(f"{status} {name}{un}\nID: {r['user_id']}")
+            text = "\n".join(parts)
+        await q.edit_message_text(text, reply_markup=back_dashboard())
+        return
+
+    if data in {"block", "unblock", "add_admin", "remove_admin"}:
+        if data in {"add_admin", "remove_admin"} and not owner(user.id):
+            await q.answer("শুধু owner এই কাজ করতে পারে।", show_alert=True)
+            return
+        context.user_data["action"] = data
+        prompts = {
+            "block": "🚫 যেই user-কে block করতে চাও তার Telegram ID পাঠাও।",
+            "unblock": "✅ যেই user-কে unblock করতে চাও তার Telegram ID পাঠাও।",
+            "add_admin": "➕ নতুন admin-এর Telegram ID পাঠাও।",
+            "remove_admin": "➖ যে admin-কে remove করতে চাও তার Telegram ID পাঠাও।"
+        }
+        await q.message.reply_text(prompts[data])
+        return
+
+    if data == "admin_list":
+        rows = db_exec("SELECT user_id FROM admins ORDER BY added_at", fetch=True)
+        text = "👑 OWNERS\n\n" + "\n".join(f"👑 {x}" for x in sorted(OWNER_IDS))
+        text += "\n\n🛡 EXTRA ADMINS\n"
+        text += "\n".join(f"🛡 {r['user_id']}" for r in rows) if rows else "None"
+        await q.edit_message_text(text, reply_markup=back_dashboard())
+        return
+
+    if data == "reply_menu":
+        await q.edit_message_text(
+            "💬 REPLY SYSTEM",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Reply", callback_data="reply_add")],
+                [InlineKeyboardButton("📋 View Replies", callback_data="reply_list")],
+                [InlineKeyboardButton("🗑 Delete Reply", callback_data="reply_delete")],
+                [InlineKeyboardButton("⬅️ Dashboard", callback_data="dashboard")]
+            ])
+        )
+        return
+
+    if data == "reply_add":
+        context.user_data["action"] = "reply_add"
+        await q.message.reply_text(
+            "➕ এই format-এ পাঠাও:\n\nkeyword | reply message\n\n"
+            "Example:\nhello | Hi! Welcome."
+        )
+        return
+
+    if data == "reply_list":
+        rows = db_exec("SELECT id,keyword,response,enabled FROM replies ORDER BY id DESC", fetch=True)
+        if not rows:
+            text = "💬 No replies."
+        else:
+            text = "💬 AUTO REPLIES\n\n" + "\n".join(
+                f"#{r['id']} | {r['keyword']} | {'ON' if r['enabled'] else 'OFF'}\n↳ {r['response']}"
+                for r in rows
             )
+        await q.edit_message_text(
+            text[:3900],
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Reply Menu", callback_data="reply_menu")]]
+            )
+        )
+        return
 
+    if data == "reply_delete":
+        context.user_data["action"] = "reply_delete"
+        await q.message.reply_text("🗑 যে reply delete করতে চাও তার ID পাঠাও।")
+        return
+
+    if data == "broadcast":
+        if not owner(user.id):
+            await q.answer("শুধু owner broadcast করতে পারবে।", show_alert=True)
+            return
+        context.user_data["action"] = "broadcast"
+        await q.message.reply_text("📢 যে message broadcast করতে চাও সেটি পাঠাও।")
+        return
+
+
+async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
+    user = update.effective_user
+    register(user)
+
+    if blocked(user.id):
+        await update.message.reply_text("🚫 আপনার account blocked করা হয়েছে।")
+        return
+
+    state = context.user_data.get("action")
+    text = update.message.text.strip()
+
+    if admin(user.id) and state:
+        action = state
+
+        if action in {"block", "unblock", "add_admin", "remove_admin"}:
+            try:
+                target = int(text)
+            except ValueError:
+                await update.message.reply_text("❌ শুধু numeric Telegram ID পাঠাও।")
+                return
+
+            if action == "block":
+                if target in OWNER_IDS:
+                    await update.message.reply_text("❌ Owner-কে block করা যাবে না।")
+                else:
+                    db_exec("UPDATE users SET blocked=1 WHERE user_id=?", (target,))
+                    await update.message.reply_text(f"🚫 {target} blocked.")
+            elif action == "unblock":
+                db_exec("UPDATE users SET blocked=0 WHERE user_id=?", (target,))
+                await update.message.reply_text(f"✅ {target} unblocked.")
+            elif action == "add_admin":
+                if not owner(user.id):
+                    await update.message.reply_text("🚫 শুধু owner পারবে।")
+                elif target in OWNER_IDS:
+                    await update.message.reply_text("ℹ️ এটি already owner.")
+                else:
+                    db_exec(
+                        "INSERT OR REPLACE INTO admins(user_id,added_by,added_at) VALUES(?,?,?)",
+                        (target, user.id, now())
+                    )
+                    await update.message.reply_text(f"✅ {target} added as admin.")
+            elif action == "remove_admin":
+                if target in OWNER_IDS:
+                    await update.message.reply_text("❌ Owner remove করা যাবে না।")
+                else:
+                    db_exec("DELETE FROM admins WHERE user_id=?", (target,))
+                    await update.message.reply_text(f"✅ {target} removed.")
+            context.user_data.pop("action", None)
+            return
+
+        if action == "reply_add":
+            if "|" not in text:
+                await update.message.reply_text("❌ Format: keyword | reply message")
+                return
+            keyword, response = [x.strip() for x in text.split("|", 1)]
+            if not keyword or not response:
+                await update.message.reply_text("❌ দুটো অংশই দিতে হবে।")
+                return
+            db_exec(
+                "INSERT OR REPLACE INTO replies(keyword,response,enabled) VALUES(?,?,1)",
+                (keyword.lower(), response)
+            )
+            context.user_data.pop("action", None)
+            await update.message.reply_text("✅ Auto-reply saved.")
+            return
+
+        if action == "reply_delete":
+            try:
+                rid = int(text)
+            except ValueError:
+                await update.message.reply_text("❌ Reply ID দাও।")
+                return
+            db_exec("DELETE FROM replies WHERE id=?", (rid,))
+            context.user_data.pop("action", None)
+            await update.message.reply_text(f"🗑 Reply #{rid} deleted.")
+            return
+
+        if action == "broadcast":
+            if not owner(user.id):
+                await update.message.reply_text("🚫 শুধু owner broadcast করতে পারে।")
+                context.user_data.pop("action", None)
+                return
+            rows = db_exec("SELECT user_id FROM users WHERE blocked=0", fetch=True)
+            sent = failed = 0
+            await update.message.reply_text("📢 Broadcast শুরু হয়েছে...")
+            for row in rows:
+                try:
+                    await context.bot.send_message(row["user_id"], text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            context.user_data.pop("action", None)
+            await update.message.reply_text(
+                f"📢 Broadcast complete.\n\n✅ Sent: {sent}\n❌ Failed: {failed}"
+            )
+            return
+
+    usage(user.id)
+    lower = text.lower()
+    if "hello" in lower or lower == "hi":
+        reply = "হ্যালো! কেমন আছো?"
+    elif "কেমন আছো" in lower:
+        reply = "আমি ভালো আছি। তুমি কেমন আছো?"
+    elif "জোক" in lower or "joke" in lower:
+        reply = "😂 শিক্ষক: পড়া শিখেছো? ছাত্র: স্যার, বই খুলেছি—এটাই অনেক!"
+    elif "গোলাপ" in lower or "rose" in lower:
+        reply = "🌹 তোমার জন্য একটি সুন্দর গোলাপ!"
     else:
+        reply = "🤖 তোমার message পেয়েছি। নিচের button ব্যবহার করে features ব্যবহার করতে পারো।"
+    await send_text_voice(update.message, reply, voice=True)
 
-        lines.append(
-            "No extra admin added."
+
+async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    user = update.effective_user
+    if user:
+        register(user)
+    text = update.message.text.lower()
+    rows = db_exec(
+        "SELECT keyword,response FROM replies WHERE enabled=1 ORDER BY LENGTH(keyword) DESC",
+        fetch=True
+    )
+    for row in rows:
+        if row["keyword"].lower() in text:
+            await update.message.reply_text(row["response"])
+            return
+
+
+async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    for member in update.message.new_chat_members:
+        await update.message.reply_text(
+            f"🌟 Welcome {member.first_name or 'বন্ধু'}!\nRIYA Bot group-এ active হয়েছে।"
         )
 
-    await query.edit_message_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Dashboard",
-                    callback_data="dashboard"
-                )
-            ]
-        ])
+
+async def error_handler(update, context):
+    logger.error("Telegram error: %s", context.error)
+
+
+def main():
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Only two commands: /start and /dashboard.
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+
+    app.add_handler(CallbackQueryHandler(button))
+
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            new_members
+        )
     )
 
-
-# =========================================================
-# REPLY SYSTEM MENU
-# =========================================================
-
-def reply_menu_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "➕ Add Reply",
-                callback_data="reply_add"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📋 View Replies",
-                callback_data="reply_list"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🗑 Delete Reply",
-                callback_data="reply_delete"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "⬅️ Dashboard",
-                callback_data="dashboard"
-            )
-        ],
-    ])
-
-
-async def reply_menu(query):
-
-    if not is_admin(query.from_user.id):
-        return
-
-    await query.edit_message_text(
-        "💬 GROUP AUTO-REPLY SYSTEM\n\n"
-        "এখান থেকে group-এর জন্য keyword ও reply message "
-        "add/delete করতে পারবে।",
-        reply_markup=reply_menu_keyboard()
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            private_text
+        )
     )
 
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+            group_text
+        )
+    )
 
-# =========================================================
-# REPLY LIST
-# =========================================================
+    app.add_error_handler(error_handler)
 
-async d
+    logger.info("RIYA Bot is running.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
